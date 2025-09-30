@@ -73,8 +73,11 @@ if 'FLASHRL_CONFIG' in os.environ and 'SGLANG_PATCH' not in os.environ and check
         patch_status = patch_vllm_lmhead_to_fp32()
         logger.debug(f"Patching vllm lmhead to fp32... status: {patch_status}")
 elif 'FLASHRL_CONFIG' in os.environ and 'SGLANG_PATCH' in os.environ and check_sglang_installed():
-    from .sglang_patch import patch_sglang_Engine
+    from .sglang_patch import patch_sglang_Engine, patch_sglang_load_weights_and_postprocess
     patch_status = patch_sglang_Engine()
-    logger.debug(f"Patching the sglang Engine to enable flash_rl quantization... status: {patch_status}")
+    logger.debug(f"Patching the sglang Engine status: {patch_status}")
+
+    patch_status = patch_sglang_load_weights_and_postprocess()
+    logger.debug(f"Patching the sglang load_weights_and_postprocess status: {patch_status}")
 else:
     logger.debug("Skipping the patching of vllm")
