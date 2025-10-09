@@ -5,6 +5,9 @@ import torch
 import types
 import logging
 from packaging.version import parse
+import sglang
+from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 from torch import nn
 from .flash_quantization import get_quantize_fn
@@ -22,6 +25,7 @@ def bond_method_to_cls(func, obj):
 recorded_loader_keys = [
     'weight_loader',
     'load_qkv_weight',
+    'load_column_parallel_weight',
     'load_row_parallel_weight',
     'load_merged_column_weight',
     'output_dim',
@@ -84,142 +88,188 @@ def get_config_data_and_flash_rl_profile():
         return config_data, flash_rl_profile
     return None, None
 
+def check_updated(name, updated_params, quant_fn_name):
+    if name in updated_params:
+        return True
+
+    if quant_fn_name in ['fp8', 'fp8_vllm', 'fp8_vllm_fast', 'fp8_fast'] \
+            and name.endswith('weight_scale') \
+            and name[:-6] in updated_params:
+        return True
+
+    return False
+
+def qwen2_load_weights(weights, causal_model):
+    stacked_params_mapping = [
+        # (param_name, shard_name, shard_id)
+        ("qkv_proj", "q_proj", "q"),
+        ("qkv_proj", "k_proj", "k"),
+        ("qkv_proj", "v_proj", "v"),
+        ("gate_up_proj", "gate_proj", 0),
+        ("gate_up_proj", "up_proj", 1),
+    ]
+
+    params_dict = dict(causal_model.named_parameters())
+    loaded_params = set()
+    for name, loaded_weight in weights:
+        layer_id = get_layer_id(name)
+        if (
+            layer_id is not None
+            and hasattr(causal_model.model, "start_layer")
+            and (
+                layer_id < causal_model.model.start_layer
+                or layer_id >= causal_model.model.end_layer
+            )
+        ):
+            continue
+
+        if "rotary_emb.inv_freq" in name or "projector" in name:
+            continue
+        if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+            # Models trained using ColossalAI may include these tensors in
+            # the checkpoint. Skip them.
+            continue
+        if causal_model.config.tie_word_embeddings and "lm_head.weight" in name:
+            continue
+        if name.startswith("model.vision_tower") and name not in params_dict:
+            continue
+
+        for param_name, weight_name, shard_id in stacked_params_mapping:
+            if weight_name not in name:
+                continue
+            name = name.replace(weight_name, param_name)
+            # Skip loading extra bias for GPTQ models.
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            param = params_dict[name]
+            weight_loader = param.weight_loader
+            weight_loader(param, loaded_weight, shard_id)
+            loaded_params.add(name)
+            break
+        else:
+            # Skip loading extra bias for GPTQ models.
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+
+            if name in params_dict.keys():
+                param = params_dict[name]
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
+                )
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+            else:
+                logger.warning(f"Parameter {name} not found in params_dict")
+    return loaded_params
+
 @staticmethod
 def hacked_load_weights_and_postprocess(
     model,
     weights,
     target_device,
     hacked_data_dict = None,
+    updated_params = None,
 ):
     # Hack model.load_weights first.
     config_data, flash_rl_profile = get_config_data_and_flash_rl_profile()
     if (not hasattr(model, 'beforeflashrl_load_weights')) and (config_data.get('fn', 'int8') != 'bf16'):
+        # Get quantization function.
         quant_fn = config_data.get('fn', 'int8')
         model.flashrl_quant_fn = quant_fn
         logger.debug(f"flash_rl quantization function: {quant_fn}")
         flash_quantize_fn = get_quantize_fn(quant_fn)
 
         # Store the original load_weights function
-        original_load_weights = model.load_weights
-        model.beforeflashrl_load_weights = original_load_weights
+        model.beforeflashrl_load_weights = model.load_weights
         def hacked_load_weights(
+            self,
             weights,
         ):
             # Skip the case: When reload weights, hacked_load_weights calls load_weights_and_postprocess, it loads weights repeatedly.
             if weights is None:
                 return
-            
-            print("Run hacked_load_weights")
+
             start_time = time.time()
             setattr(model, 'hacked_not_need_process_weights_after_loading', False)
 
+            # First time load weights.
             if not hasattr(model, "hacked_original_weights_rebuild_keys"):
-                print("First time load weights, call original_load_weights")
-                return original_load_weights(weights)
+                logger.debug("First time load weights, call original_load_weights")
+                return self.beforeflashrl_load_weights(weights)
 
-            if 'module_attribute_to_preserve' in config_data:
-                logger.debug(f"flash_rl module_attribute_to_preserve: {config_data['module_attribute_to_preserve']}")
-                flash_rl_module_attribute_to_preserve = config_data.get('module_attribute_to_preserve')
-            else:
-                flash_rl_module_attribute_to_preserve = []
-
-            if len(flash_rl_module_attribute_to_preserve) > 0:
-                for _, module in model.named_modules():
-                    for attr in flash_rl_module_attribute_to_preserve:
-                        if torch.is_tensor(getattr(module, attr, None)):
-                            setattr(module, f'hacked_{attr}', getattr(module, attr))
-
+            # Record existing_params in hacked_data_dict.
+            logger.debug("Run hacked_load_weights, not first time")
             existing_params = dict(model.named_parameters())
-
             hacked_data_dict = {}
             for name, p in existing_params.items():
                 hacked_data_dict[name] = p.data
 
+            # Create empty tensors for existing_params and set attributes.
             for name, (shape, stride, dtype, nbytes) in model.hacked_original_weights_rebuild_keys.items():
                 if name in existing_params:
                     existing_params[name].data = torch.empty(shape, dtype=dtype)
-
             for k, loader_k in model.hacked_recorded_loader.items():
                 for n, loader in loader_k.items():
                     if not hasattr(existing_params[n], k):
                         setattr(existing_params[n], k, bond_method_to_cls(loader, existing_params[n]))
-
             del existing_params
 
             end_time = time.time()
             logger.debug(f"flash_rl load_weights preparation took {end_time - start_time:.2f} seconds")
             start_time = end_time
 
-            logger.debug("Second time load weights")
-            original_load_weights(
-                flash_quantize_fn(weights, flash_rl_profile)
+            # Load weights.
+            updated_params = qwen2_load_weights(
+                flash_quantize_fn(weights, flash_rl_profile),
+                self,
             )
+            del weights
 
             end_time = time.time()
             logger.debug(f"flash_rl original_load_weights took {end_time - start_time:.2f} seconds")
             start_time = end_time
 
-            del weights
-            # if hasattr(model, 'hacked_target_device'):
+            # Process weights after loading.
             from sglang.srt.model_loader.loader import DefaultModelLoader
-            DefaultModelLoader.load_weights_and_postprocess(model, None, None, hacked_data_dict=hacked_data_dict)
+            DefaultModelLoader.load_weights_and_postprocess(model, None, None, hacked_data_dict=hacked_data_dict, updated_params=updated_params)
             setattr(model, 'hacked_not_need_process_weights_after_loading', True)
-            # else:
-            #     setattr(model, 'hacked_not_need_process_weights_after_loading', False)
-            #     for name, p in model.named_parameters():
-            #         strided_data = torch.as_strided(p.data, hacked_data_dict[name].shape, hacked_data_dict[name].stride())
-            #         hacked_data_dict[name].copy_(strided_data)
 
-            #         tmp_data = p.data
-            #         p.data = hacked_data_dict[name]
-            #         del tmp_data
-
+            # Clean up.
             del hacked_data_dict
             gc.collect()
             torch.cuda.empty_cache()
-
-            if len(flash_rl_module_attribute_to_preserve) > 0:
-                for _, module in model.named_modules():
-                    for attr in flash_rl_module_attribute_to_preserve:
-                        if torch.is_tensor(getattr(module, attr, None)):
-                            assert hasattr(module, f'hacked_{attr}'), f"module {module} does not have attribute hacked_{attr}"
-                            setattr(module, attr, getattr(module, f'hacked_{attr}'))
-                            delattr(module, f'hacked_{attr}')
 
             end_time = time.time()
             logger.debug(f"flash_rl load_weights process_weights_after_loading took {end_time - start_time:.2f} seconds")
             return
 
-        model.load_weights = hacked_load_weights
+        model.load_weights = types.MethodType(hacked_load_weights, model)
         logger.debug("Successfully patched the load_weights function of sglang")
     else:
         logger.debug("sglang load_weights patching skipped")
 
-    # Load weights.
-    print("Run hacked_load_weights_and_postprocess")
-    print("model.load_weights", model.load_weights)
-    model.load_weights(weights)
-
-    # Postprocess.
+    # Record target_device
     if target_device is None:
         target_device = getattr(model, 'hacked_target_device', None)
     else:
         setattr(model, 'hacked_target_device', target_device)
 
-    # if getattr(model, 'hacked_not_need_process_weights_after_loading', False):
-    #     logger.debug("vllm process_weights_after_loading already processed")
-    #     return
-
+    # Load weights.
+    logger.debug("Run hacked_load_weights_and_postprocess")
+    model.load_weights(weights)
     original_weights = dict(model.named_parameters())
 
+    # Record original_weights_rebuild_keys.
     # this can be optimized for better memory usage, leave for future work...
     if not hasattr(model, 'hacked_original_weights_rebuild_keys'):
+        logger.debug("Record original_weights_rebuild_keys")
         model.hacked_original_weights_rebuild_keys = {}
         for name, p in original_weights.items():
             model.hacked_original_weights_rebuild_keys[name] = (p.shape, p.stride(), p.dtype, p.untyped_storage().nbytes())
 
-    # record weight_loader
+    # Record loaders.
     if not hasattr(model, 'hacked_recorded_loader'):
+        logger.debug("Record loaders")
         recorded_loader = {k: dict() for k in recorded_loader_keys}
         for name, p in original_weights.items():
             for k in recorded_loader.keys():
@@ -235,6 +285,7 @@ def hacked_load_weights_and_postprocess(
 
     # Original process_weights_after_loading.
     if not getattr(model, 'hacked_not_need_process_weights_after_loading', False):
+        logger.debug("Process weights after loading")
         from sglang.srt.model_loader.loader import device_loading_context
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
@@ -249,13 +300,20 @@ def hacked_load_weights_and_postprocess(
 
     # Restore stride and move data back.
     if hacked_data_dict is not None:
+        logger.debug("Restore stride and move data back")
+        skipped_params = list()
         for name, p in model.named_parameters():
-            strided_data = torch.as_strided(p.data, hacked_data_dict[name].shape, hacked_data_dict[name].stride())
-            hacked_data_dict[name].copy_(strided_data)
+            if check_updated(name, updated_params, model.flashrl_quant_fn):
+                strided_data = torch.as_strided(p.data, hacked_data_dict[name].shape, hacked_data_dict[name].stride())
+                hacked_data_dict[name].copy_(strided_data)
+            else:
+                skipped_params.append(name)
 
             tmp_data = p.data
             p.data = hacked_data_dict[name]
             del tmp_data
+        logger.debug(f"flash_rl load_weights skipped params: {skipped_params}")
+        del skipped_params
 
 def patch_sglang_load_weights_and_postprocess():
     try:
@@ -290,21 +348,19 @@ def patch_sglang_Engine():
                 # sampler_patch_status = patch_vllm_logprob_compute()
                 # logger.debug(f"Patching vllm Sampler... status: {sampler_patch_status}")
 
+                # Get config path.
                 config = os.environ.get("FLASHRL_CONFIG", None)
-
-                # TODO: Check if sglang needs to determine distributed_executor_backend
-                # if 'distributed_executor_backend' not in kwargs or kwargs['distributed_executor_backend'] != 'external_launcher':
-                #     logger.error("flash_rl only supports external_launcher for now")
                 assert 'RANK' in os.environ and 'WORLD_SIZE' in os.environ, \
                     'flash_rl only supports external_launcher for now'
 
+                # Get dp rank to calculate config index.
                 rank = int(os.environ.get("RANK", None))
                 mp_size = kwargs.get('tensor_parallel_size', 1) * kwargs.get('pipeline_parallel_size', 1)
                 os.environ['MP_SIZE'] = str(mp_size)
                 dp_rank = rank // mp_size
 
                 if config is not None:
-                    # Load the config file and set the model
+                    # Load the config file.
                     # Assuming config is a JSON file, you can use json.load() to read it
                     logger.info(f"flash_rl config detected.")
                     config_data = load_flashrl_config(config)
@@ -317,41 +373,33 @@ def patch_sglang_Engine():
                     for k, v in config_data.items():
                         logger.info(f"rank {rank} flash_rl config: {k}: {v}")
 
+                    # Overload model and other args to engine.
                     for key in keys_to_overload:
                         if key in config_data:
                             logger.debug(f"Overloading {key} with {config_data[key]}")
                             kwargs[key] = config_data.get(key)
                     model = config_data.get('model', kwargs.get('model_path'))
                     kwargs['model_path'] = model
+
                     if config_data.get('fn', 'int8') != 'bf16':
+                        # Check sglang version.
+                        if parse(sglang.__version__) != parse('0.4.6.post5'):
+                            logger.warning(
+                                f'detected sglang version {sglang.__version__}'
+                                'for sglang != 0.4.6.post5, `FlashRL` has not been tested'
+                            )
 
-                        # TODO: Check sglang version here.
+                        # Check quantization function.
+                        assert config_data.get('fn', 'int8') == 'int8', "flash_rl only supports int8 for sglang"
 
-                        if config_data.get('fn', 'int8') in ['fp8_vllm', 'fp8', 'fp8_fast', 'fp8_vllm_fast']:
-                            if 'profile' in config_data:
-                                logger.warning(f"flash_rl fp8 profile is not needed, but set as {config_data['profile']}")
-                            flash_rl_profile = None
-                            kwargs['quantization'] = "w8a8_fp8"
-                        else:
-                            quant_profile = config_data.get('profile', os.path.join(model, 'profile.pt'))
-                            logger.debug(f"Loading flash_rl profile from: {quant_profile}")
-
-                            quant_profile_path = quant_profile.strip()
-                            if not os.path.exists(quant_profile_path):
-                                from huggingface_hub import hf_hub_download
-                                quant_profile_path = quant_profile_path.split('/')
-                                assert len(quant_profile_path) >= 3, f'Invalid flash_rl profile path: {quant_profile_path}'
-                                quant_profile_path = hf_hub_download(repo_id='/'.join(quant_profile_path[:2]), filename='/'.join(quant_profile_path[2:]))
-
-                            flash_rl_profile = torch.load(quant_profile_path)
-                            kwargs['quantization'] = "w8a8_int8"
-
+                        # Set quantization.
+                        kwargs['quantization'] = "w8a8_int8"
                 else:
                     logger.info(f"flash_rl config not detected.")
                     logger.info(f"Using the original model: {kwargs.get('model')}")
 
                 # Call the parent's __init__ with the custom model
-                print(f"kwargs given to sglang Engine: {kwargs}")
+                logger.debug(f"kwargs given to sglang Engine: {kwargs}")
                 init_return = original_init(
                     self,
                     **kwargs,
