@@ -160,7 +160,7 @@ def qwen2_load_weights(weights, causal_model):
                 loaded_params.add(name)
             else:
                 logger.warning(f"Parameter {name} not found in params_dict")
-    return loaded_params
+    return list(loaded_params)
 
 @staticmethod
 def hacked_load_weights_and_postprocess(
@@ -190,25 +190,25 @@ def hacked_load_weights_and_postprocess(
                 return
 
             start_time = time.time()
-            setattr(model, 'hacked_not_need_process_weights_after_loading', False)
+            setattr(self, 'hacked_not_need_process_weights_after_loading', False)
 
             # First time load weights.
-            if not hasattr(model, "hacked_original_weights_rebuild_keys"):
+            if not hasattr(self, "hacked_original_weights_rebuild_keys"):
                 logger.debug("First time load weights, call original_load_weights")
                 return self.beforeflashrl_load_weights(weights)
 
             # Record existing_params in hacked_data_dict.
             logger.debug("Run hacked_load_weights, not first time")
-            existing_params = dict(model.named_parameters())
+            existing_params = dict(self.named_parameters())
             hacked_data_dict = {}
             for name, p in existing_params.items():
                 hacked_data_dict[name] = p.data
 
             # Create empty tensors for existing_params and set attributes.
-            for name, (shape, stride, dtype, nbytes) in model.hacked_original_weights_rebuild_keys.items():
+            for name, (shape, stride, dtype, nbytes) in self.hacked_original_weights_rebuild_keys.items():
                 if name in existing_params:
                     existing_params[name].data = torch.empty(shape, dtype=dtype)
-            for k, loader_k in model.hacked_recorded_loader.items():
+            for k, loader_k in self.hacked_recorded_loader.items():
                 for n, loader in loader_k.items():
                     if not hasattr(existing_params[n], k):
                         setattr(existing_params[n], k, bond_method_to_cls(loader, existing_params[n]))
@@ -231,8 +231,8 @@ def hacked_load_weights_and_postprocess(
 
             # Process weights after loading.
             from sglang.srt.model_loader.loader import DefaultModelLoader
-            DefaultModelLoader.load_weights_and_postprocess(model, None, None, hacked_data_dict=hacked_data_dict, updated_params=updated_params)
-            setattr(model, 'hacked_not_need_process_weights_after_loading', True)
+            DefaultModelLoader.load_weights_and_postprocess(self, None, None, hacked_data_dict=hacked_data_dict, updated_params=updated_params)
+            setattr(self, 'hacked_not_need_process_weights_after_loading', True)
 
             # Clean up.
             del hacked_data_dict
@@ -299,21 +299,15 @@ def hacked_load_weights_and_postprocess(
                     quant_method.process_weights_after_loading(module)
 
     # Restore stride and move data back.
+    logger.debug(f"hacked_data_dict is None: {hacked_data_dict is None}")
     if hacked_data_dict is not None:
-        logger.debug("Restore stride and move data back")
-        skipped_params = list()
         for name, p in model.named_parameters():
-            if check_updated(name, updated_params, model.flashrl_quant_fn):
+            if check_updated(name, updated_params, model.flashrl_quant_fn):                    
                 strided_data = torch.as_strided(p.data, hacked_data_dict[name].shape, hacked_data_dict[name].stride())
                 hacked_data_dict[name].copy_(strided_data)
-            else:
-                skipped_params.append(name)
-
             tmp_data = p.data
             p.data = hacked_data_dict[name]
             del tmp_data
-        logger.debug(f"flash_rl load_weights skipped params: {skipped_params}")
-        del skipped_params
 
 def patch_sglang_load_weights_and_postprocess():
     try:
@@ -327,7 +321,7 @@ def patch_sglang_load_weights_and_postprocess():
             logger.debug("Successfully patched the load_weights_and_postprocess function of sglang")
         else:
             logger.debug("sglang load_weights_and_postprocess already patched")
-    except ImportError:
+    except ImportError as e:
         logger.error(f"Error patching sglang load_weights_and_postprocess: {e}")
         return False
     return True
