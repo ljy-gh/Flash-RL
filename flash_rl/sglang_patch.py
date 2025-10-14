@@ -88,18 +88,7 @@ def get_config_data_and_flash_rl_profile():
         return config_data, flash_rl_profile
     return None, None
 
-def check_updated(name, updated_params, quant_fn_name):
-    if name in updated_params:
-        return True
-
-    if quant_fn_name in ['fp8', 'fp8_vllm', 'fp8_vllm_fast', 'fp8_fast'] \
-            and name.endswith('weight_scale') \
-            and name[:-6] in updated_params:
-        return True
-
-    return False
-
-def qwen2_load_weights(weights, causal_model):
+def qwen2_get_updated_params(weights, causal_model):
     stacked_params_mapping = [
         # (param_name, shard_name, shard_id)
         ("qkv_proj", "q_proj", "q"),
@@ -110,7 +99,7 @@ def qwen2_load_weights(weights, causal_model):
     ]
 
     params_dict = dict(causal_model.named_parameters())
-    loaded_params = set()
+    updated_params = set()
     for name, loaded_weight in weights:
         layer_id = get_layer_id(name)
         if (
@@ -141,10 +130,7 @@ def qwen2_load_weights(weights, causal_model):
             # Skip loading extra bias for GPTQ models.
             if name.endswith(".bias") and name not in params_dict:
                 continue
-            param = params_dict[name]
-            weight_loader = param.weight_loader
-            weight_loader(param, loaded_weight, shard_id)
-            loaded_params.add(name)
+            updated_params.add(name)
             break
         else:
             # Skip loading extra bias for GPTQ models.
@@ -152,15 +138,8 @@ def qwen2_load_weights(weights, causal_model):
                 continue
 
             if name in params_dict.keys():
-                param = params_dict[name]
-                weight_loader = getattr(
-                    param, "weight_loader", default_weight_loader
-                )
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-            else:
-                logger.warning(f"Parameter {name} not found in params_dict")
-    return list(loaded_params)
+                updated_params.add(name)
+    return list(updated_params)
 
 @staticmethod
 def hacked_load_weights_and_postprocess(
@@ -190,27 +169,30 @@ def hacked_load_weights_and_postprocess(
                 return
 
             start_time = time.time()
-            setattr(self, 'hacked_not_need_process_weights_after_loading', False)
 
             # First time load weights.
             if not hasattr(self, "hacked_original_weights_rebuild_keys"):
                 logger.debug("First time load weights, call original_load_weights")
                 return self.beforeflashrl_load_weights(weights)
 
+            # Get updated params.
+            updated_params = qwen2_get_updated_params(weights, self)
+            # logger.debug("updated_params: ", updated_params)
+
             # Record existing_params in hacked_data_dict.
             logger.debug("Run hacked_load_weights, not first time")
             existing_params = dict(self.named_parameters())
             hacked_data_dict = {}
-            for name, p in existing_params.items():
-                hacked_data_dict[name] = p.data
+            for name in updated_params:
+                hacked_data_dict[name] = existing_params[name].data
 
             # Create empty tensors for existing_params and set attributes.
             for name, (shape, stride, dtype, nbytes) in self.hacked_original_weights_rebuild_keys.items():
-                if name in existing_params:
-                    existing_params[name].data = torch.empty(shape, dtype=dtype)
+                if name in updated_params:
+                    existing_params[name].data = torch.empty(shape, dtype=dtype, device=existing_params[name].device)
             for k, loader_k in self.hacked_recorded_loader.items():
                 for n, loader in loader_k.items():
-                    if not hasattr(existing_params[n], k):
+                    if n in updated_params and not hasattr(existing_params[n], k):
                         setattr(existing_params[n], k, bond_method_to_cls(loader, existing_params[n]))
             del existing_params
 
@@ -219,9 +201,8 @@ def hacked_load_weights_and_postprocess(
             start_time = end_time
 
             # Load weights.
-            updated_params = qwen2_load_weights(
+            self.beforeflashrl_load_weights(
                 flash_quantize_fn(weights, flash_rl_profile),
-                self,
             )
             del weights
 
@@ -230,9 +211,9 @@ def hacked_load_weights_and_postprocess(
             start_time = end_time
 
             # Process weights after loading.
+            setattr(self, 'hacked_not_need_process_weights_after_loading', True)
             from sglang.srt.model_loader.loader import DefaultModelLoader
             DefaultModelLoader.load_weights_and_postprocess(self, None, None, hacked_data_dict=hacked_data_dict, updated_params=updated_params)
-            setattr(self, 'hacked_not_need_process_weights_after_loading', True)
 
             # Clean up.
             del hacked_data_dict
@@ -259,6 +240,21 @@ def hacked_load_weights_and_postprocess(
     model.load_weights(weights)
     original_weights = dict(model.named_parameters())
 
+    # Original process_weights_after_loading.
+    if not getattr(model, 'hacked_not_need_process_weights_after_loading', False):
+        logger.debug("Process weights after loading")
+        from sglang.srt.model_loader.loader import device_loading_context
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                # When quant methods need to process weights after loading
+                # (for repacking, quantizing, etc), they expect parameters
+                # to be on the global target device. This scope is for the
+                # case where cpu offloading is used, where we will move the
+                # parameters onto device for processing and back off after.
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+
     # Record original_weights_rebuild_keys.
     # this can be optimized for better memory usage, leave for future work...
     if not hasattr(model, 'hacked_original_weights_rebuild_keys'):
@@ -283,28 +279,14 @@ def hacked_load_weights_and_postprocess(
                         recorded_loader[k][name] = attr
         model.hacked_recorded_loader = recorded_loader
 
-    # Original process_weights_after_loading.
-    if not getattr(model, 'hacked_not_need_process_weights_after_loading', False):
-        logger.debug("Process weights after loading")
-        from sglang.srt.model_loader.loader import device_loading_context
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                # When quant methods need to process weights after loading
-                # (for repacking, quantizing, etc), they expect parameters
-                # to be on the global target device. This scope is for the
-                # case where cpu offloading is used, where we will move the
-                # parameters onto device for processing and back off after.
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
-
     # Restore stride and move data back.
     logger.debug(f"hacked_data_dict is None: {hacked_data_dict is None}")
     if hacked_data_dict is not None:
-        for name, p in model.named_parameters():
-            if check_updated(name, updated_params, model.flashrl_quant_fn):                    
-                strided_data = torch.as_strided(p.data, hacked_data_dict[name].shape, hacked_data_dict[name].stride())
-                hacked_data_dict[name].copy_(strided_data)
+        logger.debug(f"updated_params: {updated_params}")
+        for name in updated_params:
+            p = original_weights[name]
+            strided_data = torch.as_strided(p.data, hacked_data_dict[name].shape, hacked_data_dict[name].stride())
+            hacked_data_dict[name].copy_(strided_data)
             tmp_data = p.data
             p.data = hacked_data_dict[name]
             del tmp_data
