@@ -100,6 +100,7 @@ def qwen2_get_updated_params(weights, causal_model):
 
     params_dict = dict(causal_model.named_parameters())
     updated_params = set()
+    is_last_update = False
     for name, loaded_weight in weights:
         layer_id = get_layer_id(name)
         if (
@@ -139,7 +140,10 @@ def qwen2_get_updated_params(weights, causal_model):
 
             if name in params_dict.keys():
                 updated_params.add(name)
-    return list(updated_params)
+
+        if name == "lm_head.weight":
+            is_last_update = True
+    return list(updated_params), is_last_update
 
 @staticmethod
 def hacked_load_weights_and_postprocess(
@@ -150,10 +154,13 @@ def hacked_load_weights_and_postprocess(
     updated_params = None,
 ):
     # Hack model.load_weights first.
-    config_data, flash_rl_profile = get_config_data_and_flash_rl_profile()
-    if (not hasattr(model, 'beforeflashrl_load_weights')) and (config_data.get('fn', 'int8') != 'bf16'):
+    if not hasattr(model, 'config_data'):
+        config_data, flash_rl_profile = get_config_data_and_flash_rl_profile()
+        setattr(model, 'config_data', config_data)
+        setattr(model, 'flash_rl_profile', flash_rl_profile)
+    if (not hasattr(model, 'beforeflashrl_load_weights')) and (model.config_data.get('fn', 'int8') != 'bf16'):
         # Get quantization function.
-        quant_fn = config_data.get('fn', 'int8')
+        quant_fn = model.config_data.get('fn', 'int8')
         model.flashrl_quant_fn = quant_fn
         logger.debug(f"flash_rl quantization function: {quant_fn}")
         flash_quantize_fn = get_quantize_fn(quant_fn)
@@ -173,11 +180,11 @@ def hacked_load_weights_and_postprocess(
             # First time load weights.
             if not hasattr(self, "hacked_original_weights_rebuild_keys"):
                 logger.debug("First time load weights, call original_load_weights")
-                return self.beforeflashrl_load_weights(weights)
+                self.beforeflashrl_load_weights(weights)
+                return
 
             # Get updated params.
-            updated_params = qwen2_get_updated_params(weights, self)
-            # logger.debug("updated_params: ", updated_params)
+            updated_params, is_last_update = qwen2_get_updated_params(weights, self)
 
             # Record existing_params in hacked_data_dict.
             logger.debug("Run hacked_load_weights, not first time")
@@ -202,7 +209,7 @@ def hacked_load_weights_and_postprocess(
 
             # Load weights.
             self.beforeflashrl_load_weights(
-                flash_quantize_fn(weights, flash_rl_profile),
+                flash_quantize_fn(weights, self.flash_rl_profile),
             )
             del weights
 
@@ -217,8 +224,9 @@ def hacked_load_weights_and_postprocess(
 
             # Clean up.
             del hacked_data_dict
-            gc.collect()
-            torch.cuda.empty_cache()
+            if is_last_update:
+                gc.collect()
+                torch.cuda.empty_cache()
 
             end_time = time.time()
             logger.debug(f"flash_rl load_weights process_weights_after_loading took {end_time - start_time:.2f} seconds")
