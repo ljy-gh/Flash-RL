@@ -196,7 +196,7 @@ def hacked_load_weights_and_postprocess(
             # Create empty tensors for existing_params and set attributes.
             for name, (shape, stride, dtype, nbytes) in self.hacked_original_weights_rebuild_keys.items():
                 if name in updated_params:
-                    existing_params[name].data = torch.empty(shape, dtype=dtype, device=existing_params[name].device)
+                    existing_params[name].data = torch.as_strided(existing_params[name].data.clone(), shape, stride)
             for k, loader_k in self.hacked_recorded_loader.items():
                 for n, loader in loader_k.items():
                     if n in updated_params and not hasattr(existing_params[n], k):
@@ -248,21 +248,6 @@ def hacked_load_weights_and_postprocess(
     model.load_weights(weights)
     original_weights = dict(model.named_parameters())
 
-    # Original process_weights_after_loading.
-    if not getattr(model, 'hacked_not_need_process_weights_after_loading', False):
-        logger.debug("Process weights after loading")
-        from sglang.srt.model_loader.loader import device_loading_context
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                # When quant methods need to process weights after loading
-                # (for repacking, quantizing, etc), they expect parameters
-                # to be on the global target device. This scope is for the
-                # case where cpu offloading is used, where we will move the
-                # parameters onto device for processing and back off after.
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
-
     # Record original_weights_rebuild_keys.
     # this can be optimized for better memory usage, leave for future work...
     if not hasattr(model, 'hacked_original_weights_rebuild_keys'):
@@ -287,12 +272,28 @@ def hacked_load_weights_and_postprocess(
                         recorded_loader[k][name] = attr
         model.hacked_recorded_loader = recorded_loader
 
+    # Original process_weights_after_loading.
+    if not getattr(model, 'hacked_not_need_process_weights_after_loading', False):
+        logger.debug("Original process weights after loading")
+        from sglang.srt.model_loader.loader import device_loading_context
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                # When quant methods need to process weights after loading
+                # (for repacking, quantizing, etc), they expect parameters
+                # to be on the global target device. This scope is for the
+                # case where cpu offloading is used, where we will move the
+                # parameters onto device for processing and back off after.
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+
     # Restore stride and move data back.
     logger.debug(f"hacked_data_dict is None: {hacked_data_dict is None}")
     if hacked_data_dict is not None:
         logger.debug(f"updated_params: {updated_params}")
+        processed_weights = dict(model.named_parameters())
         for name in updated_params:
-            p = original_weights[name]
+            p = processed_weights[name]
             strided_data = torch.as_strided(p.data, hacked_data_dict[name].shape, hacked_data_dict[name].stride())
             hacked_data_dict[name].copy_(strided_data)
             tmp_data = p.data
