@@ -102,6 +102,9 @@ def qwen2_get_updated_params(weights, causal_model):
     updated_params = set()
     is_last_update = False
     for name, loaded_weight in weights:
+        if name == "lm_head.weight":
+            is_last_update = True
+
         layer_id = get_layer_id(name)
         if (
             layer_id is not None
@@ -141,10 +144,9 @@ def qwen2_get_updated_params(weights, causal_model):
             if name in params_dict.keys():
                 updated_params.add(name)
 
-        if name == "lm_head.weight":
-            is_last_update = True
     return list(updated_params), is_last_update
 
+backup = {}
 @staticmethod
 def hacked_load_weights_and_postprocess(
     model,
@@ -222,11 +224,17 @@ def hacked_load_weights_and_postprocess(
             from sglang.srt.model_loader.loader import DefaultModelLoader
             DefaultModelLoader.load_weights_and_postprocess(self, None, None, hacked_data_dict=hacked_data_dict, updated_params=updated_params)
 
-            # Clean up.
+            # Clean up and restore weight_scale.
             del hacked_data_dict
             if is_last_update:
                 gc.collect()
                 torch.cuda.empty_cache()
+
+                # Restore weight_scale.
+                global backup
+                for name, p in self.named_parameters():
+                    if "weight_scale" in name:
+                        p.data.copy_(backup[name])
 
             end_time = time.time()
             logger.debug(f"flash_rl load_weights process_weights_after_loading took {end_time - start_time:.2f} seconds")
@@ -286,6 +294,13 @@ def hacked_load_weights_and_postprocess(
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+
+        # Backup weight_scale.
+        global backup
+        processed_weights = dict(model.named_parameters())
+        for name, p in processed_weights.items():
+            if "weight_scale" in name:
+                backup[name] = p.data.clone().cpu()
 
     # Restore stride and move data back.
     logger.debug(f"hacked_data_dict is None: {hacked_data_dict is None}")
