@@ -8,6 +8,7 @@ from packaging.version import parse
 import sglang
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+import json
 
 from torch import nn
 from .flash_quantization import get_quantize_fn
@@ -36,8 +37,6 @@ recorded_loader_keys = [
 keys_to_overload = [
     'load_format',
     'quantization',
-    # TODO: Check if sglang needs to determine distributed_executor_backend
-    # 'distributed_executor_backend',
 ]
 
 def load_flashrl_config(config):
@@ -195,7 +194,7 @@ def hacked_load_weights_and_postprocess(
             for name in updated_params:
                 hacked_data_dict[name] = existing_params[name].data
 
-            # Create empty tensors for existing_params and set attributes.
+            # Clone existing_params and set attributes.
             for name, (shape, stride, dtype, nbytes) in self.hacked_original_weights_rebuild_keys.items():
                 if name in updated_params:
                     existing_params[name].data = torch.as_strided(existing_params[name].data.clone(), shape, stride)
@@ -295,7 +294,7 @@ def hacked_load_weights_and_postprocess(
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
 
-        # Backup weight_scale.
+        # Backup weight_scale after loading weights first time.
         global backup
         processed_weights = dict(model.named_parameters())
         for name, p in processed_weights.items():
@@ -344,10 +343,6 @@ def patch_sglang_Engine():
                 self,
                 **kwargs
             ) -> None:
-                # Patch the sampler class (TODO: patch sglang sampler)
-                # sampler_patch_status = patch_vllm_logprob_compute()
-                # logger.debug(f"Patching vllm Sampler... status: {sampler_patch_status}")
-
                 # Get config path.
                 config = os.environ.get("FLASHRL_CONFIG", None)
                 assert 'RANK' in os.environ and 'WORLD_SIZE' in os.environ, \
@@ -380,7 +375,17 @@ def patch_sglang_Engine():
                             kwargs[key] = config_data.get(key)
                     model = config_data.get('model', kwargs.get('model_path'))
                     kwargs['model_path'] = model
-
+                    
+                    # Check model.
+                    model_config_path = os.path.join(model, 'config.json')
+                    with open(model_config_path, 'r') as f:
+                        model_config = json.load(f)
+                        model_architectures = model_config.get('architectures', None)
+                        if model_architectures:
+                            model_architectures = model_architectures[0]
+                        logger.debug(f"model_architectures: {model_architectures}")
+                        assert model_architectures == 'Qwen2ForCausalLM', "flash_rl only supports Qwen2ForCausalLM for now."
+                    
                     if config_data.get('fn', 'int8') != 'bf16':
                         # Check sglang version.
                         if parse(sglang.__version__) != parse('0.4.6.post5'):
@@ -404,8 +409,6 @@ def patch_sglang_Engine():
                     self,
                     **kwargs,
                 )
-
-                # TODO: Quantize weights before loading
 
                 return init_return
 
