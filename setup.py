@@ -34,6 +34,7 @@ with open('HISTORY.rst') as history_file:
 requirements = [
     'torch',
     'transformers',
+    'vllm',
     'huggingface_hub',
 ]
 
